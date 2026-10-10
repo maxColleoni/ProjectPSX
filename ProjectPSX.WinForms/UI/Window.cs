@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
@@ -280,6 +280,9 @@ namespace ProjectPSX {
         }
 
         private void vramViewerToggle(object sender, KeyEventArgs e) {
+            if (e.KeyCode == Keys.F) {
+                uncapped = !uncapped;
+            }
             if(e.KeyCode == Keys.Tab) {
                 if (!isVramViewer) {
                     screen.Size = vramSize;
@@ -305,7 +308,7 @@ namespace ProjectPSX {
         }
 
         private void OnTimedEvent(object sender, ElapsedEventArgs e) {
-            Text = $"ProjectPSX | Cpu {(int)((float)cpuCyclesCounter / (PSX_MHZ / MIPS_UNDERCLOCK) * SYNC_CYCLES)}% | Vps {GetVPS()}";
+            Text = $"ProjectPSX | Cpu {(int)((float)cpuCyclesCounter / (PSX_MHZ / MIPS_UNDERCLOCK) * SYNC_CYCLES)}% | Vps {GetVPS()}{(uncapped ? " | FAST (F)" : "")}";
             cpuCyclesCounter = 0;
         }
 
@@ -313,6 +316,33 @@ namespace ProjectPSX {
             Task t = Task.Factory.StartNew(EXECUTE, TaskCreationOptions.LongRunning);
         }
 
+        // Real-time speed: one frame per NTSC field (59.94 Hz). Uncapped, the
+        // emulator outran audio playback and the 300 ms audio buffer discarded
+        // the excess (crackling); at real speed audio is produced exactly as
+        // fast as it plays. F toggles uncapped speed (fast-forward).
+        private static readonly long FrameTicks = Stopwatch.Frequency * 1001 / 60000;
+        private readonly Stopwatch frameClock = Stopwatch.StartNew();
+        private long nextFrameTicks;
+        private volatile bool uncapped;
+
+        private void LimitSpeed() {
+            long now = frameClock.ElapsedTicks;
+            if (uncapped) {
+                nextFrameTicks = now;
+                return;
+            }
+            nextFrameTicks += FrameTicks;
+            // Fell far behind (loading, window dragged): don't race to catch up.
+            if (nextFrameTicks < now - FrameTicks * 5)
+                nextFrameTicks = now;
+            while ((now = frameClock.ElapsedTicks) < nextFrameTicks) {
+                // Sleep while there's time, spin for the last couple of ms.
+                if (nextFrameTicks - now > Stopwatch.Frequency / 500)
+                    Thread.Sleep(1);
+                else
+                    Thread.SpinWait(100);
+            }
+        }
         private void EXECUTE() {
             Process.GetCurrentProcess().PriorityClass = ProcessPriorityClass.High;
             Thread.CurrentThread.Priority = ThreadPriority.Highest;
@@ -321,6 +351,7 @@ namespace ProjectPSX {
                 while (true) {
                     psx.RunFrame();
                     cpuCyclesCounter += cycles;
+                    LimitSpeed();
                 }
             } catch (Exception e) {
                 Console.WriteLine(e.ToString());
