@@ -54,7 +54,7 @@ namespace ProjectPSX.Devices.Spu {
                 }
             }
 
-            public uint interpolationIndex => (register >> 3) & 0xFF;
+            public uint interpolationIndex => (register >> 4) & 0xFF; //bits 4-11
         }
         public Counter counter;
 
@@ -78,6 +78,8 @@ namespace ProjectPSX.Devices.Spu {
             old = 0;
             older = 0;
             currentAddress = startAddress;
+            counter.register = 0;
+            Array.Clear(decodedSamples); //no interpolation from the previous note
             adsrCounter = 0;
             adsrVolume = 0;
             adsrPhase = Phase.Attack;
@@ -127,7 +129,7 @@ namespace ProjectPSX.Devices.Spu {
                 nibble = (nibble + 1) & 0x1;
 
                 int t = signed4bit((byte)((spuAdpcm[position] >> (nibble * 4)) & 0x0F));
-                int s = (t << shift) + ((old * f0 + older * f1 + 32) / 64);
+                int s = (t << shift) + ((old * f0 + older * f1 + 32) >> 6);
                 short sample = (short)Math.Clamp(s, -0x8000, 0x7FFF);
 
                 decodedSamples[3 + i] = sample;

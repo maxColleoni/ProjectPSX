@@ -724,6 +724,8 @@ namespace ProjectPSX.Devices {
         private int counter = 0;
         private const int CYCLES_PER_SAMPLE = 0x300; //33868800 / 44100hz
         private int reverbCounter = 0;
+        private short reverbOutL;
+        private short reverbOutR;
         public bool tick(int cycles) {
             bool edgeTrigger = false;
             counter += cycles;
@@ -823,15 +825,14 @@ namespace ProjectPSX.Devices {
                 }
             }
 
+            // reverb is on a 22050hz clock, its output is held for both samples
             if (reverbCounter == 0) {
-                var (reverbL, reverbR) = processReverb(sumLeftReverb, sumRightReverb);
-
-                sumLeft += reverbL;
-                sumRight += reverbR;
+                (reverbOutL, reverbOutR) = processReverb(sumLeftReverb, sumRightReverb);
             }
-
-            // reverb is on a 22050hz clock
             reverbCounter = (reverbCounter + 1) & 0x1;
+
+            sumLeft += reverbOutL;
+            sumRight += reverbOutR;
 
             //Write to capture buffers and check ram irq
             edgeTrigger |= handleCaptureBuffer(0 * 1024 + captureBufferPos, cdL);
@@ -1080,17 +1081,19 @@ namespace ProjectPSX.Devices {
         private unsafe void writeReverb(uint addr, short value) {
             if (!control.reverbMasterEnabled) return;
 
-            uint relative = (addr + ramReverbInternalAddress - ramReverbStartAddress) % (0x8_0000 - ramReverbStartAddress);
-            uint wrapped = (ramReverbStartAddress + relative) & 0x7_FFFE;
-
-            *(short*)(ram + wrapped) = value;
+            *(short*)(ram + wrapReverb(addr)) = value;
         }
 
         private unsafe short loadReverb(uint addr) {
-            uint relative = (addr + ramReverbInternalAddress - ramReverbStartAddress) % (0x8_0000 - ramReverbStartAddress);
-            uint wrapped = (ramReverbStartAddress + relative) & 0x7_FFFE;
+            return *(short*)(ram + wrapReverb(addr));
+        }
 
-            return *(short*)(ram + wrapped);
+        //Offsets like mLSAME - 2 can go below 0: wrap within the work area with signed math
+        private uint wrapReverb(uint addr) {
+            int size = (int)(0x8_0000 - ramReverbStartAddress);
+            int relative = ((int)addr + (int)ramReverbInternalAddress - (int)ramReverbStartAddress) % size;
+            if (relative < 0) relative += size;
+            return (uint)(ramReverbStartAddress + relative) & 0x7_FFFE;
         }
 
     }

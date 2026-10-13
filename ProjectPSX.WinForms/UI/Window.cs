@@ -25,6 +25,9 @@ namespace ProjectPSX {
         private const int cyclesPerFrame = PSX_MHZ / 60;
         private const int syncLoops = (cyclesPerFrame / (SYNC_CYCLES * MIPS_UNDERCLOCK)) + 1;
         private const int cycles = syncLoops * SYNC_CYCLES;
+        // Clock cycles one RunFrame emulates (ProjectPSX.RunFrame ticks the bus
+        // SYNC_CYCLES * MIPS_UNDERCLOCK + 1 per loop): 566482, about 1/59.79 s.
+        private const long emulatedCyclesPerFrame = (long)syncLoops * (SYNC_CYCLES * MIPS_UNDERCLOCK + 1);
 
         private Size vramSize = new Size(1024, 512);
         private Size _640x480 = new Size(640, 480);
@@ -94,7 +97,9 @@ namespace ProjectPSX {
             };
 
             bufferedWaveProvider.DiscardOnBufferOverflow = true;
-            bufferedWaveProvider.BufferDuration = new TimeSpan(0, 0, 0, 0, 300);
+            bufferedWaveProvider.BufferDuration = TimeSpan.FromMilliseconds(500);
+            waveOutEvent.DesiredLatency = 90;
+            waveOutEvent.NumberOfBuffers = 3;
             waveOutEvent.Init(bufferedWaveProvider);
 
             string diskFilename = GetDiskFilename();
@@ -302,7 +307,10 @@ namespace ProjectPSX {
         public void Play(byte[] samples) {
             bufferedWaveProvider.AddSamples(samples, 0, samples.Length);
 
-            if (waveOutEvent.PlaybackState != PlaybackState.Playing) {
+            // Start with a cushion, or the device's first reads come up short and
+            // get padded with silence.
+            if (waveOutEvent.PlaybackState != PlaybackState.Playing
+                && bufferedWaveProvider.BufferedDuration.TotalMilliseconds >= AudioLowMs) {
                 waveOutEvent.Play();
             }
         }
@@ -316,11 +324,16 @@ namespace ProjectPSX {
             Task t = Task.Factory.StartNew(EXECUTE, TaskCreationOptions.LongRunning);
         }
 
-        // Real-time speed: one frame per NTSC field (59.94 Hz). Uncapped, the
-        // emulator outran audio playback and the 300 ms audio buffer discarded
-        // the excess (crackling); at real speed audio is produced exactly as
-        // fast as it plays. F toggles uncapped speed (fast-forward).
-        private static readonly long FrameTicks = Stopwatch.Frequency * 1001 / 60000;
+        // Real-time speed: each frame takes as long as the time it emulates, so the
+        // SPU makes 44100 samples a second, as fast as they play. Uncapped, the
+        // emulator outran playback and the audio buffer discarded the excess
+        // (crackling). The audio buffer has the last word, so the Stopwatch and
+        // the sound card's clocks can't drift apart: below AudioLowMs frames run
+        // without waiting, above AudioHighMs they wait for playback.
+        // F toggles uncapped speed (fast-forward).
+        private static readonly long FrameTicks = Stopwatch.Frequency * emulatedCyclesPerFrame / PSX_MHZ;
+        private const double AudioLowMs = 60;
+        private const double AudioHighMs = 150;
         private readonly Stopwatch frameClock = Stopwatch.StartNew();
         private long nextFrameTicks;
         private volatile bool uncapped;
@@ -335,6 +348,13 @@ namespace ProjectPSX {
             // Fell far behind (loading, window dragged): don't race to catch up.
             if (nextFrameTicks < now - FrameTicks * 5)
                 nextFrameTicks = now;
+            double audioMs = bufferedWaveProvider.BufferedDuration.TotalMilliseconds;
+            if (audioMs < AudioLowMs) {
+                nextFrameTicks = now;
+                return;
+            }
+            if (audioMs > AudioHighMs)
+                nextFrameTicks = Math.Max(nextFrameTicks, now + FrameTicks);
             while ((now = frameClock.ElapsedTicks) < nextFrameTicks) {
                 // Sleep while there's time, spin for the last couple of ms.
                 if (nextFrameTicks - now > Stopwatch.Frequency / 500)
