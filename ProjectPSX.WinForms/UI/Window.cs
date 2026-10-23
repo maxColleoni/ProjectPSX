@@ -108,7 +108,14 @@ namespace ProjectPSX {
             var timer = new System.Timers.Timer(1000);
             timer.Elapsed += OnTimedEvent;
             timer.Enabled = true;
+        }
 
+        // The emulation thread draws straight onto the screen control. Started
+        // from the constructor, its first frame could come before the form had
+        // its window, and the control's window was then created on the
+        // emulation thread, which never pumps messages: the form never showed.
+        protected override void OnShown(EventArgs e) {
+            base.OnShown(e);
             RunUncapped();
         }
 
