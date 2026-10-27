@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
@@ -117,6 +118,12 @@ namespace ProjectPSX.Devices {
         private bool isTexturedRectangleYFlipped;
 
         private uint drawModeBits = 0xFFFF_FFFF;
+
+        // 480-line interlace with drawing to the display area prohibited (GP0
+        // E1h bit 10 clear): the GPU leaves the lines of the field on screen
+        // alone, so a game draws each frame into the other field. The parity
+        // of the lines left alone, -1 when every line is drawn.
+        private int skippedLineParity => isVerticalInterlace && isVerticalResolution480 && !isDrawingToDisplayAllowed ? (isOddLine ? 1 : 0) : -1;
         private uint displayModeBits = 0xFFFF_FFFF;
         uint displayVerticalRange = 0xFFFF_FFFF;
         uint displayHorizontalRange = 0xFFFF_FFFF;
@@ -423,14 +430,17 @@ namespace ProjectPSX.Devices {
             ushort h = (ushort)((hw >> 16) & 0x1FF);
 
             int color = color0.r << 16 | color0.g << 8 | color0.b;
+            int skip = skippedLineParity;
 
             if(x + w <= 0x3FF && y + h <= 0x1FF) {
                 var vramSpan = new Span<int>(vram.Bits);
                 for (int yPos = y; yPos < h + y; yPos++) {
+                    if ((yPos & 1) == skip) continue;
                     vramSpan.Slice(x + (yPos * 1024), w).Fill(color);
                 }
             } else {
                 for (int yPos = y; yPos < h + y; yPos++) {
+                    if ((yPos & 1) == skip) continue;
                     for (int xPos = x; xPos < w + x; xPos++) {
                         vram.SetPixel(xPos & 0x3FF, yPos & 0x1FF, color);
                     }
@@ -547,87 +557,137 @@ namespace ProjectPSX.Devices {
             int w1_row = orient2d(v2, v0, min) + bias1;
             int w2_row = orient2d(v0, v1, min) + bias2;
 
-            // Rasterize
-            for (int y = min.y; y < max.y; y++) {
-                // Barycentric coordinates at start of row
-                int w0 = w0_row;
-                int w1 = w1_row;
-                int w2 = w2_row;
+            // Colour and texture coordinates: value = N / area, where N is the
+            // weighted sum t0 * (w0 - bias0) + t1 * (w1 - bias1) + t2 * (w2 - bias2)
+            // (what interpolate() computes). N steps by a constant per pixel and
+            // per row, and the division is a multiply by a reciprocal that's
+            // exact for 0 <= N < 2^31 (Granlund-Montgomery): no division per pixel.
+            int recipShift = 31 + (32 - BitOperations.LeadingZeroCount((uint)(area - 1)));
+            ulong recip = (((ulong)1 << recipShift) + (uint)area - 1) / (uint)area;
 
-                for (int x = min.x; x < max.x; x++) {
-                    // If p is on or inside all edges, render pixel.
-                    if ((w0 | w1 | w2) >= 0) {
-                        //Adjustements per triangle instead of per pixel can be done at area level
-                        //but it still does some little by 1 error apreciable on some textured quads
-                        //I assume it could be handled recalculating AXX and BXX offsets but those maths are beyond my scope
+            int wb0 = w0_row - bias0, wb1 = w1_row - bias1, wb2 = w2_row - bias2;
+            color0.val = c0;
+            color1.val = c1;
+            color2.val = c2;
+            int cr0 = color0.r, cr1 = color1.r, cr2 = color2.r;
+            int cg0 = color0.g, cg1 = color1.g, cg2 = color2.g;
+            int cb0 = color0.b, cb1 = color1.b, cb2 = color2.b;
+            long rRow = (long)cr0 * wb0 + (long)cr1 * wb1 + (long)cr2 * wb2;
+            long gRow = (long)cg0 * wb0 + (long)cg1 * wb1 + (long)cg2 * wb2;
+            long bRow = (long)cb0 * wb0 + (long)cb1 * wb1 + (long)cb2 * wb2;
+            long uRow = (long)t0.x * wb0 + (long)t1.x * wb1 + (long)t2.x * wb2;
+            long vRow = (long)t0.y * wb0 + (long)t1.y * wb1 + (long)t2.y * wb2;
+            long rDx = (long)cr0 * A12 + (long)cr1 * A20 + (long)cr2 * A01, rDy = (long)cr0 * B12 + (long)cr1 * B20 + (long)cr2 * B01;
+            long gDx = (long)cg0 * A12 + (long)cg1 * A20 + (long)cg2 * A01, gDy = (long)cg0 * B12 + (long)cg1 * B20 + (long)cg2 * B01;
+            long bDx = (long)cb0 * A12 + (long)cb1 * A20 + (long)cb2 * A01, bDy = (long)cb0 * B12 + (long)cb1 * B20 + (long)cb2 * B01;
+            long uDx = (long)t0.x * A12 + (long)t1.x * A20 + (long)t2.x * A01, uDy = (long)t0.x * B12 + (long)t1.x * B20 + (long)t2.x * B01;
+            long vDx = (long)t0.y * A12 + (long)t1.y * A20 + (long)t2.y * A01, vDy = (long)t0.y * B12 + (long)t1.y * B20 + (long)t2.y * B01;
 
-                        //Check background mask
-                        if (checkMaskBeforeDraw) {
-                            color0.val = (uint)vram.GetPixelRGB888(x, y); //back
-                            if (color0.m != 0) {
-                                w0 += A12;
-                                w1 += A20;
-                                w2 += A01;
-                                continue;
-                            }
-                        }
+            // Rasterize: on each row, only the run inside all three edges
+            // (where the edge functions w0 w1 w2 are all >= 0). The state the
+            // pixels need, in locals.
+            int[] bits = vram.Bits;
+            bool checkMask = checkMaskBeforeDraw;
+            int maskBit = maskWhileDrawing << 24;
+            int pmx = preMaskX, qmx = postMaskX, pmy = preMaskY, qmy = postMaskY;
+            bool shaded = primitive.isShaded, textured = primitive.isTextured, raw = primitive.isRawTextured;
+            bool semi = primitive.isSemiTransparent;
+            int semiMode = primitive.semiTransparencyMode;
+            int flat = (int)c0;
+            int skip = skippedLineParity;
+            for (int y = min.y; y < max.y; y++, w0_row += B12, w1_row += B20, w2_row += B01,
+                 rRow += rDy, gRow += gDy, bRow += bDy, uRow += uDy, vRow += vDy) {
+                if ((y & 1) == skip)
+                    continue;
+                int xs = min.x, xe = max.x;
+                clipToEdge(ref xs, ref xe, min.x, w0_row, A12);
+                clipToEdge(ref xs, ref xe, min.x, w1_row, A20);
+                clipToEdge(ref xs, ref xe, min.x, w2_row, A01);
+                if (xs >= xe)
+                    continue;
+                int dx = xs - min.x;
+                long rN = rRow + rDx * dx, gN = gRow + gDx * dx, bN = bRow + bDx * dx;
+                long uN = uRow + uDx * dx, vN = vRow + vDx * dx;
+                int row = y * VRAM.Width;
 
-                        // reset default color of the triangle calculated outside the for as it gets overwriten as follows...
-                        int color = (int)c0;
+                for (int x = xs; x < xe; x++, rN += rDx, gN += gDx, bN += bDx, uN += uDx, vN += vDx) {
+                    //Check background mask
+                    if (checkMask && (bits[row + x] & unchecked((int)0xFF00_0000)) != 0)
+                        continue;
 
-                        if (primitive.isShaded) {
-                            color0.val = c0;
-                            color1.val = c1;
-                            color2.val = c2;
+                    int color = flat;
 
-                            int r = interpolate(w0 - bias0, w1 - bias1, w2 - bias2, color0.r, color1.r, color2.r, area);
-                            int g = interpolate(w0 - bias0, w1 - bias1, w2 - bias2, color0.g, color1.g, color2.g, area);
-                            int b = interpolate(w0 - bias0, w1 - bias1, w2 - bias2, color0.b, color1.b, color2.b, area);
-                            color = r << 16 | g << 8 | b;
-                        }
-
-                        if (primitive.isTextured) {
-                            int texelX = interpolate(w0 - bias0, w1 - bias1, w2 - bias2, t0.x, t1.x, t2.x, area);
-                            int texelY = interpolate(w0 - bias0, w1 - bias1, w2 - bias2, t0.y, t1.y, t2.y, area);
-                            int texel = getTexel(maskTexelAxis(texelX, preMaskX, postMaskX), maskTexelAxis(texelY, preMaskY, postMaskY), primitive.clut, primitive.textureBase, primitive.depth);
-                            if (texel == 0) {
-                                w0 += A12;
-                                w1 += A20;
-                                w2 += A01;
-                                continue;
-                            }
-
-                            if (!primitive.isRawTextured) {
-                                color0.val = (uint)color;
-                                color1.val = (uint)texel;
-                                color1.r = clampToFF(color0.r * color1.r >> 7);
-                                color1.g = clampToFF(color0.g * color1.g >> 7);
-                                color1.b = clampToFF(color0.b * color1.b >> 7);
-
-                                texel = (int)color1.val;
-                            }
-
-                            color = texel;
-                        }
-
-                        if (primitive.isSemiTransparent && (!primitive.isTextured || (color & 0xFF00_0000) != 0)) {
-                            color = handleSemiTransp(x, y, color, primitive.semiTransparencyMode);
-                        }
-
-                        color |= maskWhileDrawing << 24;
-
-                        vram.SetPixel(x, y, color);
+                    if (shaded) {
+                        int r = (int)(((ulong)rN * recip) >> recipShift);
+                        int g = (int)(((ulong)gN * recip) >> recipShift);
+                        int b = (int)(((ulong)bN * recip) >> recipShift);
+                        color = r << 16 | g << 8 | b;
                     }
-                    // One step to the right
-                    w0 += A12;
-                    w1 += A20;
-                    w2 += A01;
+
+                    if (textured) {
+                        int texelX = (int)(((ulong)uN * recip) >> recipShift);
+                        int texelY = (int)(((ulong)vN * recip) >> recipShift);
+                        int texel = getTexel(texelX & 0xFF & pmx | qmx, texelY & 0xFF & pmy | qmy, primitive.clut, primitive.textureBase, primitive.depth);
+                        if (texel == 0)
+                            continue;
+
+                        if (!raw)
+                            texel = modulate(color, texel);
+
+                        color = texel;
+                    }
+
+                    if (semi && (!textured || (color & 0xFF00_0000) != 0))
+                        color = blend(bits[row + x], color, semiMode);
+
+                    bits[row + x] = color | maskBit;
                 }
-                // One row step
-                w0_row += B12;
-                w1_row += B20;
-                w2_row += B01;
             }
+        }
+
+        // Narrows [xs, xe) to the pixels where w + a * (x - x0) >= 0.
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static void clipToEdge(ref int xs, ref int xe, int x0, int w, int a) {
+            if (a > 0) {
+                if (w < 0) {
+                    int first = x0 + (-w + a - 1) / a;
+                    if (first > xs) xs = first;
+                }
+            } else if (a < 0) {
+                if (w < 0) {
+                    xe = xs;
+                    return;
+                }
+                int end = x0 + w / -a + 1;
+                if (end < xe) xe = end;
+            } else if (w < 0) {
+                xe = xs;
+            }
+        }
+
+        // A texel tinted by the primitive's colour (128 = as is), per byte;
+        // the texel's top byte (its STP bit) stays.
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static int modulate(int color, int texel) {
+            int c0 = Math.Min(0xFF, (color & 0xFF) * (texel & 0xFF) >> 7);
+            int c1 = Math.Min(0xFF, (color >> 8 & 0xFF) * (texel >> 8 & 0xFF) >> 7);
+            int c2 = Math.Min(0xFF, (color >> 16 & 0xFF) * (texel >> 16 & 0xFF) >> 7);
+            return (int)((uint)texel & 0xFF00_0000) | c2 << 16 | c1 << 8 | c0;
+        }
+
+        // handleSemiTransp() on values: `back` from VRAM, `front` drawn over it
+        // (its top byte stays).
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static int blend(int back, int front, int mode) {
+            int b0 = back & 0xFF, b1 = back >> 8 & 0xFF, b2 = back >> 16 & 0xFF;
+            int f0 = front & 0xFF, f1 = front >> 8 & 0xFF, f2 = front >> 16 & 0xFF;
+            switch (mode) {
+                case 0: f0 = (b0 + f0) >> 1; f1 = (b1 + f1) >> 1; f2 = (b2 + f2) >> 1; break;
+                case 1: f0 = Math.Min(0xFF, b0 + f0); f1 = Math.Min(0xFF, b1 + f1); f2 = Math.Min(0xFF, b2 + f2); break;
+                case 2: f0 = Math.Max(0, b0 - f0); f1 = Math.Max(0, b1 - f1); f2 = Math.Max(0, b2 - f2); break;
+                default: f0 = Math.Min(0xFF, b0 + (f0 >> 2)); f1 = Math.Min(0xFF, b1 + (f1 >> 2)); f2 = Math.Min(0xFF, b2 + (f2 >> 2)); break;
+            }
+            return (int)((uint)front & 0xFF00_0000) | f2 << 16 | f1 << 8 | f0;
         }
 
         private void GP0_RenderLine(Span<uint> buffer) {
@@ -713,6 +773,7 @@ namespace ProjectPSX.Devices {
             }
 
             int numerator = longest >> 1;
+            int skip = skippedLineParity;
 
             for (int i = 0; i <= longest; i++) {
                 float ratio = (float)i / longest;
@@ -721,7 +782,7 @@ namespace ProjectPSX.Devices {
                 //x = (short)Math.Min(Math.Max(x, drawingAreaLeft), drawingAreaRight); //this generates glitches on RR4
                 //y = (short)Math.Min(Math.Max(y, drawingAreaTop), drawingAreaBottom);
 
-                if (x >= drawingAreaLeft && x < drawingAreaRight && y >= drawingAreaTop && y < drawingAreaBottom) {
+                if (x >= drawingAreaLeft && x < drawingAreaRight && y >= drawingAreaTop && y < drawingAreaBottom && (y & 1) != skip) {
                     //if (primitive.isSemiTransparent && (!primitive.isTextured || (color & 0xFF00_0000) != 0)) {
                     if (isTransparent) {
                         color = handleSemiTransp(x, y, color, transparencyMode);
@@ -823,13 +884,13 @@ namespace ProjectPSX.Devices {
 
             int baseColor = GetRgbColor(bgrColor);
 
+            int skip = skippedLineParity;
             for (int y = yOrigin, v = vOrigin; y < height; y++, v++) {
+                if ((y & 1) == skip) continue;
                 for (int x = xOrigin, u = uOrigin; x < width; x++, u++) {
                     //Check background mask
-                    if (checkMaskBeforeDraw) {
-                        color0.val = (uint)vram.GetPixelRGB888(x & 0x3FF, y & 0x1FF); //back
-                        if (color0.m != 0) continue;
-                    }
+                    if (checkMaskBeforeDraw && (vram.GetPixelRGB888(x & 0x3FF, y & 0x1FF) & unchecked((int)0xFF00_0000)) != 0)
+                        continue;
 
                     int color = baseColor;
 
@@ -840,21 +901,14 @@ namespace ProjectPSX.Devices {
                             continue;
                         }
 
-                        if (!primitive.isRawTextured) {
-                            color0.val = (uint)color;
-                            color1.val = (uint)texel;
-                            color1.r = clampToFF(color0.r * color1.r >> 7);
-                            color1.g = clampToFF(color0.g * color1.g >> 7);
-                            color1.b = clampToFF(color0.b * color1.b >> 7);
-
-                            texel = (int)color1.val;
-                        }
+                        if (!primitive.isRawTextured)
+                            texel = modulate(color, texel);
 
                         color = texel;
                     }
 
                     if (primitive.isSemiTransparent && (!primitive.isTextured || (color & 0xFF00_0000) != 0)) {
-                        color = handleSemiTransp(x, y, color, primitive.semiTransparencyMode);
+                        color = blend(vram.GetPixelRGB888(x, y), color, primitive.semiTransparencyMode);
                     }
 
                     color |= maskWhileDrawing << 24;
