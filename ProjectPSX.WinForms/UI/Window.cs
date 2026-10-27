@@ -36,6 +36,7 @@ namespace ProjectPSX {
         private GdiBitmap display = new GdiBitmap(1024, 512);
 
         private ProjectPSX psx;
+        private Gamepads gamepads;
         private int fps;
         private bool isVramViewer;
 
@@ -104,6 +105,7 @@ namespace ProjectPSX {
 
             string diskFilename = GetDiskFilename();
             psx = new ProjectPSX(this, diskFilename);
+            gamepads = new Gamepads(psx);
 
             var timer = new System.Timers.Timer(1000);
             timer.Elapsed += OnTimedEvent;
@@ -376,6 +378,7 @@ namespace ProjectPSX {
 
             try {
                 while (true) {
+                    gamepads.Poll();
                     psx.RunFrame();
                     cpuCyclesCounter += cycles;
                     LimitSpeed();
